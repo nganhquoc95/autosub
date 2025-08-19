@@ -18,6 +18,9 @@ import wave
 import json
 import requests
 import time
+import hashlib
+import shutil
+import pickle
 try:
     from json.decoder import JSONDecodeError
 except ImportError:
@@ -35,6 +38,7 @@ DEFAULT_SUBTITLE_FORMAT = 'srt'
 DEFAULT_CONCURRENCY = 10
 DEFAULT_SRC_LANGUAGE = 'en'
 DEFAULT_DST_LANGUAGE = 'en'
+CACHE_ROOT = os.path.expanduser("~/.autosub_cache")
 
 
 def percentile(arr, percent):
@@ -231,6 +235,22 @@ def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_reg
         elapsed_time += chunk_duration
     return regions
 
+def generate_cache_key(source_path, src_lang, dst_lang, rate):
+    h = hashlib.sha1()
+    info = f"{os.path.abspath(source_path)}|{src_lang}|{dst_lang}|{rate}"
+    h.update(info.encode("utf-8"))
+    return h.hexdigest()
+
+def load_pickle(path):
+    """Load Python object has been pickle into file."""
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+def dump_pickle(path, obj):
+    """Write Python object into file by pickle."""
+    with open(path, "wb") as f:
+        pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+
 
 def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
         source_path,
@@ -240,70 +260,202 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
         dst_language=DEFAULT_DST_LANGUAGE,
         subtitle_file_format=DEFAULT_SUBTITLE_FORMAT,
         api_key=None,
+        no_cache=False,
     ):
     """
     Given an input audio/video file, generate subtitles in the specified language and format.
     """
     audio_filename, audio_rate = extract_audio(source_path)
 
+    cache_key = generate_cache_key(source_path, src_language, dst_language, audio_rate)
+    cache_dir = os.path.join(CACHE_ROOT, cache_key)
+    state_file = os.path.join(cache_dir, "state.pickle")
+
+    # Respect no_cache flag: do not create or use cache when requested
+    if no_cache:
+        cache_dir = None
+        state_file = None
+    else:
+        # Ensure cache dir exists
+        if not os.path.exists(cache_dir):
+            try:
+                os.makedirs(cache_dir)
+            except OSError:
+                # ignore races or permission errors; proceed without caching if cannot create
+                cache_dir = None
+                state_file = None
+
     regions = find_speech_regions(audio_filename)
 
     pool = multiprocessing.Pool(concurrency)
     converter = FLACConverter(source_path=audio_filename)
-    recognizer = SpeechRecognizer(language=src_language, rate=audio_rate,
-                                  api_key=GOOGLE_SPEECH_API_KEY)
+    recognizer = SpeechRecognizer(language=src_language, rate=audio_rate)
 
     transcripts = []
-    if regions:
+    # Load cached state if available and matches current regions
+    state = None
+    if state_file and os.path.exists(state_file):
         try:
-            widgets = ["Converting speech regions to FLAC files: ", Percentage(), ' ', Bar(), ' ',
-                       ETA()]
-            pbar = ProgressBar(widgets=widgets, maxval=len(regions)).start()
-            extracted_regions = []
-            for i, extracted_region in enumerate(pool.imap(converter, regions)):
-                extracted_regions.append(extracted_region)
-                pbar.update(i)
-            pbar.finish()
+            state = load_pickle(state_file)
+            if state.get('regions') == regions:
+                transcripts = state.get('transcripts', [None] * len(regions))
+            else:
+                state = None
+        except Exception:
+            state = None
 
-            widgets = ["Performing speech recognition: ", Percentage(), ' ', Bar(), ' ', ETA()]
-            pbar = ProgressBar(widgets=widgets, maxval=len(regions)).start()
+    if not transcripts:
+        transcripts = [None] * len(regions)
 
-            for i, transcript in enumerate(pool.imap(recognizer, extracted_regions)):
-                transcripts.append(transcript)
-                pbar.update(i)
-            pbar.finish()
+    pbar = None
+    try:
+        if regions:
+            # Convert & recognize only missing transcripts
+            missing_indices = [i for i, t in enumerate(transcripts) if not t]
+            if missing_indices:
+                # Prepare storage for extracted FLAC blobs (bytes) per region
+                # use dict to avoid typed-list assignment issues in static analysis
+                extracted_regions = {}
+
+                # Try to load existing FLAC blobs from cache
+                if cache_dir:
+                    for i in range(len(regions)):
+                        flac_path = os.path.join(cache_dir, f"region_{i}.flac")
+                        if os.path.exists(flac_path):
+                            try:
+                                with open(flac_path, 'rb') as fh:
+                                    extracted_regions[i] = fh.read()
+                            except Exception:
+                                # leave missing if unable to read
+                                pass
+
+                # Convert only regions that don't already have cached FLAC blobs
+                todo_conv_indices = [i for i in missing_indices if i not in extracted_regions]
+                if todo_conv_indices:
+                    widgets = ["Converting speech regions to FLAC files: ", Percentage(), ' ', Bar(), ' ', ETA()]
+                    pbar = ProgressBar(widgets=widgets, maxval=len(todo_conv_indices)).start()
+                    todo_regions = [regions[i] for i in todo_conv_indices]
+                    for j, flac_blob in enumerate(pool.imap(converter, todo_regions)):
+                        target_idx = todo_conv_indices[j]
+                        extracted_regions[target_idx] = flac_blob
+                        # persist FLAC blob to cache for future resumes
+                        if cache_dir and flac_blob:
+                            try:
+                                flac_path = os.path.join(cache_dir, f"region_{target_idx}.flac")
+                                with open(flac_path, 'wb') as fh:
+                                    fh.write(flac_blob)
+                            except Exception:
+                                pass
+                            pbar.update(j)
+                        if pbar:
+                            pbar.finish()
+
+                # Recognize speech for converted (or cached) regions
+                widgets = ["Performing speech recognition: ", Percentage(), ' ', Bar(), ' ', ETA()]
+                pbar = ProgressBar(widgets=widgets, maxval=len(missing_indices)).start()
+
+                todo_rec_regions = [extracted_regions[i] for i in missing_indices]
+                for i_rec, transcript in enumerate(pool.imap(recognizer, todo_rec_regions)):
+                    target_idx = missing_indices[i_rec]
+                    transcripts[target_idx] = transcript
+                    # persist state after each recognized item
+                    if state_file:
+                        try:
+                            dump_pickle(state_file, {
+                                'regions': regions,
+                                'transcripts': transcripts,
+                                'translated': state.get('translated') if state else None
+                            })
+                        except Exception:
+                            pass
+                        pbar.update(i_rec)
+                    if pbar:
+                        pbar.finish()
 
             if src_language.split("-")[0] != dst_language.split("-")[0]:
                 if api_key:
+                    # Load translated state if present
+                    translated = None
+                    if state_file and state and state.get('translated') and len(state.get('translated')) == len(regions):
+                        translated = state.get('translated')
+                    if not translated:
+                        translated = [None] * len(regions)
+
                     google_translate_api_key = api_key
                     translator = Translator(dst_language, google_translate_api_key,
                                             dst=dst_language,
                                             src=src_language)
                     prompt = "Translating from {0} to {1}: ".format(src_language, dst_language)
-                    widgets = [prompt, Percentage(), ' ', Bar(), ' ', ETA()]
-                    pbar = ProgressBar(widgets=widgets, maxval=len(regions)).start()
-                    translated_transcripts = []
-                    for i, transcript in enumerate(pool.imap(translator, transcripts)):
-                        translated_transcripts.append(transcript)
-                        pbar.update(i)
-                    pbar.finish()
-                    transcripts = translated_transcripts
+                    
+                    todo_translation_indices = [i for i, (t, tr) in enumerate(zip(transcripts, translated)) if t and not tr]
+                    if todo_translation_indices:
+                        widgets = [prompt, Percentage(), ' ', Bar(), ' ', ETA()]
+                        pbar = ProgressBar(widgets=widgets, maxval=len(regions)).start()
+                        todo_texts = [transcripts[i] for i in todo_translation_indices]
+                        for i_tr, translated_text in enumerate(pool.imap(translator, todo_texts)):
+                            target_idx = todo_translation_indices[i_tr]
+                            translated[target_idx] = translated_text
+                            # persist after each translation
+                            if state_file:
+                                try:
+                                    dump_pickle(state_file, {
+                                        'regions': regions,
+                                        'transcripts': transcripts,
+                                        'translated': translated
+                                    })
+                                except Exception:
+                                    pass
+                            pbar.update(i_tr)
+                        if pbar:
+                            try:
+                                pbar.finish()
+                            except Exception:
+                                pass
+                    # Use translated results where available, fall back to original transcript otherwise
+                    transcripts = [translated[i] if translated[i] else transcripts[i] for i in range(len(regions))]
                 else:
                     print(
                         "Error: Subtitle translation requires specified Google Translate API key. "
                         "See --help for further information."
                     )
+                    pool.close()
+                    pool.join()
                     return 1
 
-        except KeyboardInterrupt:
-            pbar.finish()
-            pool.terminate()
+    except KeyboardInterrupt:
+        try:
+            if pbar:
+                try:
+                    pbar.finish()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        pool.terminate()
+        pool.join()
+        # persist current state before exiting so resume is possible
+        if state_file:
+            try:
+                dump_pickle(state_file, {
+                    'regions': regions,
+                    'transcripts': transcripts,
+                    'translated': state.get('translated') if state else None
+                })
+            except Exception:
+                pass
+        print("Cancelling transcription")
+        raise
+    finally:
+        try:
+            pool.close()
             pool.join()
-            print("Cancelling transcription")
-            raise
+        except Exception:
+            pass
 
     timed_subtitles = [(r, t) for r, t in zip(regions, transcripts) if t]
     formatter = FORMATTERS.get(subtitle_file_format)
+    if not formatter:
+        raise Exception(f"Unknown subtitle format: {subtitle_file_format}")
     formatted_subtitles = formatter(timed_subtitles)
 
     dest = output
@@ -316,6 +468,14 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
         output_file.write(formatted_subtitles.encode("utf-8"))
 
     os.remove(audio_filename)
+
+    # Remove cache on successful completion
+    try:
+        if cache_dir and os.path.exists(cache_dir):
+            shutil.rmtree(cache_dir)
+    except Exception:
+        # If cleanup fails, ignore and continue — cache is non-critical
+        pass
 
     return dest
 
@@ -377,6 +537,8 @@ def main():
                         action='store_true')
     parser.add_argument('--list-languages', help="List all available source/destination languages",
                         action='store_true')
+    parser.add_argument('--no-cache', help="Disable cache (do not read/write cache files)",
+                        action='store_true')
 
     args = parser.parse_args()
 
@@ -404,6 +566,7 @@ def main():
             api_key=args.api_key,
             subtitle_file_format=args.format,
             output=args.output,
+            no_cache=args.no_cache,
         )
         print("Subtitles file created at {}".format(subtitle_file_path))
     except KeyboardInterrupt:
