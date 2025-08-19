@@ -17,6 +17,7 @@ import tempfile
 import wave
 import json
 import requests
+import time
 try:
     from json.decoder import JSONDecodeError
 except ImportError:
@@ -92,13 +93,14 @@ class SpeechRecognizer(object): # pylint: disable=too-few-public-methods
 
     def __call__(self, data):
         try:
-            for _ in range(self.retries):
+            for attempt in range(self.retries):
                 url = GOOGLE_SPEECH_API_URL.format(lang=self.language, key=self.api_key)
                 headers = {"Content-Type": "audio/x-flac; rate=%d" % self.rate}
 
                 try:
                     resp = requests.post(url, data=data, headers=headers)
                 except requests.exceptions.ConnectionError:
+                    time.sleep(10 * attempt)
                     continue
 
                 for line in resp.content.decode('utf-8').split("\n"):
