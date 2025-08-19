@@ -214,7 +214,7 @@ def find_speech_regions(filename, frame_width=4096, min_region_size=0.5, max_reg
         chunk = reader.readframes(frame_width)
         energies.append(audioop.rms(chunk, sample_width * n_channels))
 
-    threshold = percentile(energies, 0.2)
+    threshold = percentile(energies, 0.4)
 
     elapsed_time = 0
 
