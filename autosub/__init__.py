@@ -347,8 +347,11 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
                             except Exception:
                                 pass
                             pbar.update(j)
-                        if pbar:
+                    if pbar:
+                        try:
                             pbar.finish()
+                        except Exception:
+                            pass
 
                 # Recognize speech for converted (or cached) regions
                 widgets = ["Performing speech recognition: ", Percentage(), ' ', Bar(), ' ', ETA()]
@@ -369,8 +372,11 @@ def generate_subtitles( # pylint: disable=too-many-locals,too-many-arguments
                         except Exception:
                             pass
                         pbar.update(i_rec)
-                    if pbar:
+                if pbar:
+                    try:
                         pbar.finish()
+                    except Exception:
+                        pass
 
             if src_language.split("-")[0] != dst_language.split("-")[0]:
                 if api_key:
